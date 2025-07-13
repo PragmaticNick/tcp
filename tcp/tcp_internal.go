@@ -1,4 +1,4 @@
-package main
+package tcp
 
 import (
 	"fmt"
@@ -42,9 +42,12 @@ type Connection struct {
 
 	ip  *layers.IPv4
 	tcp *layers.TCP
+
+	Incoming []byte
+	Outgoing []byte
 }
 
-func (c *Connection) onPacket(nic *water.Interface, _ *layers.IPv4, tcp *layers.TCP, data []byte) error {
+func (c *Connection) OnPacket(nic *water.Interface, _ *layers.IPv4, tcp *layers.TCP, data []byte) error {
 	wend := c.recv.nxt + uint32(c.recv.wnd)
 	seglen := uint32(len(data))
 
@@ -97,7 +100,7 @@ func (c *Connection) onPacket(nic *water.Interface, _ *layers.IPv4, tcp *layers.
 	return nil
 }
 
-func accept(nic *water.Interface, iph *layers.IPv4, tcp *layers.TCP, _ []byte) (*Connection, error) {
+func Accept(nic *water.Interface, iph *layers.IPv4, tcp *layers.TCP, _ []byte) (*Connection, error) {
 	if !tcp.SYN {
 		return nil, fmt.Errorf("accept called with non-SYN packet")
 	}

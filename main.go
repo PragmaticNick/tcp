@@ -1,95 +1,35 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"log"
-	"net"
-
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/songgao/water"
-	"github.com/vishvananda/netlink"
+	"tcp-client/iface"
+	"time"
 )
 
-type Quad struct {
-	srcIP   string
-	srcPort uint16
-	dst     string
-	dstPort uint16
-}
-
 func main() {
-	config := water.Config{
-		DeviceType: water.TUN,
-	}
-	config.Name = "tun0"
-	iface, err := water.New(config)
+	ctx := context.Background()
+	i, err := iface.New(ctx, "tun0", "192.168.10.1/24")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to set up TUN interface: %v", err)
 	}
 
-	link, err := netlink.LinkByName(config.Name)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	ip, ipNet, err := net.ParseCIDR("192.168.10.1/24")
-	ipNet.IP = ip
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = netlink.AddrAdd(link, &netlink.Addr{IPNet: ipNet})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = netlink.LinkSetUp(link)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	connections := make(map[Quad]*Connection)
-
-	buffer := make([]byte, 1500)
+	listener, _ := i.Bind(9000)
 
 	for {
-		n, err := iface.Read(buffer)
+		time.Sleep(5 * time.Second)
+		stream, err := listener.Accept()
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("Failed to accept connection on port 9000")
+			continue
 		}
+		log.Printf("Accepted connection on port 9000")
 
-		packet := gopacket.NewPacket(buffer[:n], layers.LayerTypeIPv4, gopacket.Default)
-
-		if layer := packet.Layer(layers.LayerTypeIPv4); layer != nil {
-			iph, _ := layer.(*layers.IPv4)
-
-			if layer := packet.Layer(layers.LayerTypeTCP); layer != nil {
-				tcph, _ := layer.(*layers.TCP)
-
-				quad := Quad{
-					srcIP:   iph.SrcIP.String(),
-					srcPort: uint16(tcph.SrcPort),
-					dst:     iph.DstIP.String(),
-					dstPort: uint16(tcph.DstPort),
-				}
-
-				if _, exists := connections[quad]; !exists {
-					conn, err := accept(iface, iph, tcph, buffer[:n])
-					if err != nil {
-						fmt.Printf("Error accepting connection: %v\n", err)
-						continue
-					}
-					connections[quad] = conn
-				} else {
-					err = connections[quad].onPacket(iface, iph, tcph, buffer[:n])
-					if err != nil {
-						fmt.Printf("Error handling packet: %v\n", err)
-						continue
-					}
-				}
-			}
+		buffer := make([]byte, 1024)
+		n, err := stream.Read(buffer)
+		if err != nil {
+			log.Printf("Failed to read from stream: %v", err)
 		}
-
+		log.Printf("Received data: %s", string(buffer[:n]))
 	}
 }
