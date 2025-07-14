@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"tcp-client/iface"
-	"time"
 )
 
 func main() {
@@ -15,20 +14,19 @@ func main() {
 	}
 
 	listener, _ := i.Bind(9000)
+	stream, err := listener.Accept()
+	if err != nil {
+		log.Printf("Failed to accept connection on port 9000")
+		return
+	}
+	log.Printf("Accepted connection on port 9000")
 
+	buffer := make([]byte, 1024)
 	for {
-		time.Sleep(5 * time.Second)
-		stream, err := listener.Accept()
-		if err != nil {
-			log.Printf("Failed to accept connection on port 9000")
-			continue
-		}
-		log.Printf("Accepted connection on port 9000")
-
-		buffer := make([]byte, 1024)
 		n, err := stream.Read(buffer)
 		if err != nil {
 			log.Printf("Failed to read from stream: %v", err)
+			return
 		}
 		log.Printf("Received data: %s", string(buffer[:n]))
 	}

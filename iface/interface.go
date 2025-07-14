@@ -28,10 +28,16 @@ type Pending struct {
 	cond  *sync.Cond
 }
 
+type Connection struct {
+	raw *tcp.Connection
+
+	readChan chan struct{}
+}
+
 type connectionManager struct {
 	// Active TCP connections keyed by quad (srcIP:srcPort, dstIP:dstPort)
 	// This is used to handle incoming packets and manage connections
-	connections map[quad]*tcp.Connection
+	connections map[quad]*Connection
 	// Pending - binded ports with pending connections (quads) that can be accepted
 	pending map[uint16]*Pending
 
@@ -51,7 +57,7 @@ func New(ctx context.Context, name, cidr string) (*Interface, error) {
 	}
 
 	manager := &connectionManager{
-		connections: make(map[quad]*tcp.Connection),
+		connections: make(map[quad]*Connection),
 		pending:     make(map[uint16]*Pending),
 	}
 
@@ -95,9 +101,14 @@ func (i *Interface) PacketLoop() {
 
 				// If connection exist just handle the packet
 				if _, exists := i.manager.connections[quad]; exists {
-					err = i.manager.connections[quad].OnPacket(i.nic, iph, tcph, buffer[:n])
+					conn := i.manager.connections[quad]
+					err = conn.raw.OnPacket(i.nic, iph, tcph, tcph.Payload)
 					if err != nil {
 						fmt.Printf("Error handling packet: %v\n", err)
+					}
+
+					if len(conn.raw.Incoming) != 0 {
+						conn.readChan <- struct{}{}
 					}
 				} else {
 					// If someone listens on the destination port, than accept connection and add quad to pending
@@ -107,21 +118,23 @@ func (i *Interface) PacketLoop() {
 						conn, err := tcp.Accept(i.nic, iph, tcph, buffer[:n])
 						if err != nil {
 							fmt.Printf("Error accepting connection: %v\n", err)
+							pending.cond.L.Unlock()
 							continue
 						}
 
 						pending.quads = append(pending.quads, quad)
 						i.manager.pending[quad.dstPort] = pending
-						i.manager.connections[quad] = conn
+						i.manager.connections[quad] = &Connection{
+							raw:      conn,
+							readChan: make(chan struct{}, 1),
+						}
 
 						pending.cond.Broadcast()
 						pending.cond.L.Unlock()
 					}
 				}
-
 			}
 		}
-
 	}
 }
 
@@ -157,6 +170,7 @@ func (l *TcpListener) Accept() (*TcpStream, error) {
 		if len(pending.quads) > 0 {
 			quad := pending.quads[0]
 			pending.quads = pending.quads[1:]
+			pending.cond.L.Unlock()
 
 			return &TcpStream{
 				quad:    &quad,
@@ -179,22 +193,19 @@ func (s *TcpStream) Read(b []byte) (int, error) {
 	defer s.manager.mu.Unlock()
 
 	conn, ok := s.manager.connections[*s.quad]
+
 	if !ok {
 		return 0, fmt.Errorf("tcp stream terminated unexpectedly")
 	}
 
-	// TODO: Use circular buffer for incoming data
-	if len(conn.Incoming) == 0 {
-		// TODO: block
-		return 0, fmt.Errorf("no bytes to read")
+	if len(conn.raw.Incoming) == 0 {
+		fmt.Println("Locked on read, waiting for data...")
+		<-conn.readChan
 	}
 
-	// TODO: detect FIN
-
-	bytesToRead := min(len(b), len(conn.Incoming))
-
-	copy(b, conn.Incoming[:bytesToRead])
-	conn.Incoming = conn.Incoming[bytesToRead:]
+	bytesToRead := min(len(b), len(conn.raw.Incoming))
+	copy(b, conn.raw.Incoming[:bytesToRead])
+	conn.raw.Incoming = conn.raw.Incoming[bytesToRead:]
 
 	return bytesToRead, nil
 }
@@ -208,13 +219,13 @@ func (s *TcpStream) Write(b []byte) (int, error) {
 		return 0, fmt.Errorf("tcp stream terminated unexpectedly")
 	}
 
-	if len(conn.Outgoing) >= sendQueueSize {
+	if len(conn.raw.Outgoing) >= sendQueueSize {
 		// TODO: block
 		return 0, fmt.Errorf("send queue is full")
 	}
 
-	bytesToWrite := min(len(b), sendQueueSize-len(conn.Outgoing))
-	conn.Outgoing = append(conn.Outgoing, b[:bytesToWrite]...)
+	bytesToWrite := min(len(b), sendQueueSize-len(conn.raw.Outgoing))
+	conn.raw.Outgoing = append(conn.raw.Outgoing, b[:bytesToWrite]...)
 
 	// TODO: Wake up writer
 
@@ -230,7 +241,7 @@ func (s *TcpStream) Flush() error {
 		return fmt.Errorf("tcp stream terminated unexpectedly")
 	}
 
-	if len(conn.Outgoing) == 0 {
+	if len(conn.raw.Outgoing) == 0 {
 		return nil
 	}
 

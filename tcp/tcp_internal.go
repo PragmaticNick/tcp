@@ -13,9 +13,6 @@ const (
 	Listen
 	SynReceived
 	Established
-	FinWait1
-	FinWait2
-	Closing
 )
 
 type sendSequence struct {
@@ -45,59 +42,8 @@ type Connection struct {
 
 	Incoming []byte
 	Outgoing []byte
-}
 
-func (c *Connection) OnPacket(nic *water.Interface, _ *layers.IPv4, tcp *layers.TCP, data []byte) error {
-	wend := c.recv.nxt + uint32(c.recv.wnd)
-	seglen := uint32(len(data))
-
-	if seglen == 0 {
-		if c.recv.wnd == 0 {
-			if tcp.Seq != c.recv.nxt {
-				return fmt.Errorf("receive window is zero, cannot process data with seq %d", tcp.Seq)
-			}
-		} else {
-			if !isBetweenWrapped(c.recv.nxt-1, tcp.Seq, wend) {
-				return fmt.Errorf("seq %d is not in the receive window [%d, %d)", tcp.Seq, c.recv.nxt, wend)
-			}
-		}
-	} else {
-		if c.recv.wnd == 0 {
-			return fmt.Errorf("receive window is zero, cannot process data")
-		} else {
-			if !isBetweenWrapped(c.recv.nxt-1, tcp.Seq, wend) &&
-				!isBetweenWrapped(c.recv.nxt-1, tcp.Seq+uint32(len(data))-1, wend) {
-				return fmt.Errorf("seq %d is not in the receive window [%d, %d)", tcp.Seq, c.recv.nxt, wend)
-			}
-		}
-	}
-	c.recv.nxt = tcp.Seq + seglen
-
-	if !tcp.ACK {
-		return fmt.Errorf("expected ACK in packet, got %v", tcp.ACK)
-	}
-
-	if isBetweenWrapped(c.send.una, tcp.Seq, c.send.nxt+1) {
-		if !isStateSynchronized(c.state) {
-			c.send.nxt = tcp.Ack
-			c.write_rst(nic)
-		}
-		return fmt.Errorf("received packet with seq %d, but una %d and nxt %d", tcp.Seq, c.send.una, c.send.nxt)
-	}
-	c.send.una = tcp.Ack
-
-	switch c.state {
-	case SynReceived:
-		if !tcp.ACK {
-			return fmt.Errorf("expected ACK in SynReceived state, got %v", tcp.ACK)
-		}
-		c.state = Established
-	case Established:
-		fmt.Println("not implemented: handling data in Established state")
-
-		fmt.Printf("data len: %v\n", len(data))
-	}
-	return nil
+	counter uint32
 }
 
 func Accept(nic *water.Interface, iph *layers.IPv4, tcp *layers.TCP, _ []byte) (*Connection, error) {
@@ -106,6 +52,7 @@ func Accept(nic *water.Interface, iph *layers.IPv4, tcp *layers.TCP, _ []byte) (
 	}
 
 	var iss uint32 = 0
+	var wnd uint16 = 1024
 	c := &Connection{
 		state: SynReceived,
 		recv: recvSequence{
@@ -118,7 +65,7 @@ func Accept(nic *water.Interface, iph *layers.IPv4, tcp *layers.TCP, _ []byte) (
 			iss: iss,
 			una: iss,
 			nxt: iss + 1,
-			wnd: 10,
+			wnd: wnd,
 			up:  false,
 			wl1: 0,
 			wl2: 0,
@@ -147,6 +94,73 @@ func Accept(nic *water.Interface, iph *layers.IPv4, tcp *layers.TCP, _ []byte) (
 	return c, nil
 }
 
+func (c *Connection) OnPacket(nic *water.Interface, _ *layers.IPv4, tcp *layers.TCP, data []byte) error {
+	fmt.Printf("\n\n\nPacket #%v\n", c.counter)
+	c.counter++
+	// print c.recv:
+	fmt.Printf("Received packet: seq %d, ack %d, wnd %d\n", tcp.Seq, tcp.Ack, tcp.Window)
+	fmt.Printf("conn.recv: nxt %d, wnd %d, irs %d\n", c.recv.nxt, c.recv.wnd, c.recv.irs)
+	fmt.Printf("data[%v]: %s\n", len(data), string(data))
+
+	acceptable := c.isSegmentAcceptable(tcp, data)
+	if !acceptable {
+		return fmt.Errorf("segment not acceptable: seq %d, nxt %d, wnd %d", tcp.Seq, c.recv.nxt, c.recv.wnd)
+	}
+
+	if !tcp.ACK {
+		return fmt.Errorf("expected ACK in packet, got %v", tcp.ACK)
+	}
+
+	if c.state == SynReceived {
+		if isBetweenWrapped(c.send.una-1, tcp.Ack, c.send.nxt+1) {
+			c.state = Established
+		} else {
+			// TODO
+		}
+	}
+
+	if c.state == Established {
+		if isBetweenWrapped(c.send.una, tcp.Ack, c.send.nxt+1) {
+			c.send.una = tcp.Ack
+		}
+		c.Incoming = append(c.Incoming, data[(c.recv.nxt-tcp.Seq):]...)
+
+		c.recv.nxt = tcp.Seq + uint32(len(data))
+
+		c.write(nic, nil)
+	}
+
+	return nil
+}
+
+func (c *Connection) isSegmentAcceptable(tcp *layers.TCP, data []byte) bool {
+	segmentLength := uint32(len(data))
+	windowEnd := c.recv.nxt + uint32(c.recv.wnd)
+
+	if segmentLength == 0 {
+		if c.recv.wnd == 0 {
+			if tcp.Seq != c.recv.nxt {
+				return false
+			}
+		} else {
+			if !isBetweenWrapped(c.recv.nxt-1, tcp.Seq, windowEnd) {
+				return false
+			}
+		}
+	} else {
+		if c.recv.wnd == 0 {
+			return false
+		} else {
+			if !isBetweenWrapped(c.recv.nxt-1, tcp.Seq, windowEnd) &&
+				!isBetweenWrapped(c.recv.nxt-1, tcp.Seq+segmentLength-1, windowEnd) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
 func (c *Connection) write(nic *water.Interface, data []byte) error {
 	c.tcp.Seq = c.send.nxt
 	c.tcp.Ack = c.recv.nxt
@@ -162,6 +176,8 @@ func (c *Connection) write(nic *water.Interface, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to write packet: %w", err)
 	}
+
+	fmt.Printf("Sent packet: seq %d, ack %d, wnd %d\n", c.tcp.Seq, c.tcp.Ack, c.send.wnd)
 
 	c.send.nxt += uint32(len(data))
 
